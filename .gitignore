@@ -1,6 +1,11 @@
 # Per-host config — laptop IP, ports, etc. Sample at briefbot_config.py.example
 buddy/device/briefbot_config.py
 
+# Generated data files (regen from accountbriefbot dashboard).
+# Keep out of the public repo — these are regenerable artifacts.
+buddy/device/briefbot_data.jsonl
+buddy/device/briefbot_index.txt
+
 # Phase 3 secrets on the laptop side
 host/.env
 host/audio_dump/

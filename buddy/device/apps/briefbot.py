@@ -1,32 +1,29 @@
 """Briefbot for the M5 Cardputer-Adv.
 
-V1: fixture-driven prospect lookup. Pick a company from the list, see
-a paginated brief. Voice input gets layered on in Phase 2/3 (see
-PLAN.md at the repo root). The lookup interface is briefbot_api.lookup,
-which V1 backs with briefbot_fixtures.PROSPECTS so the device app
-works completely offline.
+Self-contained prospect lookup against the 1362-company icp_ranker
+dataset baked into /flash/. No WiFi, no laptop companion, no APIs —
+pure local data.
 
-Input
-  ; , w     up
-  . / s     down
-  Enter     select (picker) / no-op (brief)
-  ESC / Q   back (brief -> picker, picker -> exit)
+UX
+  type letters    filter the company list (substring match)
+  ; , w           scroll cursor up
+  . / s           scroll cursor down
+  Enter           open brief for highlighted company
+  Backspace       delete last filter char
+  ESC / Q         clear filter if non-empty, else quit to launcher
 
-Layout matches the bundle's three-zone chrome — 20 px DARK header
-with ORANGE hairline at y=20, content area, 18 px hint strip at the
-bottom. Font is DejaVu9; centering goes through textWidth() because
-the font is proportional (see buddy_ui_cp.py for the long-form
-rationale).
+The brief view scrolls long entries with the same up/down keys and
+returns to the picker on ESC.
 
-Exit protocol mirrors hello_cardputer.py: clear screen, brief pause,
-machine.reset() back to the launcher. UIFlow 2.0 has no
-return-to-launcher API on this build; soft-reboot is the only way.
+Layout matches the bundle's three-zone chrome — DARK header band with
+ORANGE hairline at y=20, content area, hint strip at the bottom. Font
+is DejaVu9; centering goes through textWidth() because it's
+proportional. Exit is via machine.reset() (UIFlow has no return-to-
+launcher API on this build).
 """
 
 import sys
 
-# Make peer modules at /flash/ importable. Same dance every Buddy
-# bundle app does — UIFlow's default sys.path doesn't include /flash.
 for _p in ("/flash", "/flash/apps"):
     if _p not in sys.path:
         sys.path.insert(0, _p)
@@ -38,26 +35,6 @@ import machine
 from hardware import MatrixKeyboard
 
 import briefbot_api
-
-# Voice support is optional — only active when briefbot_config.py
-# (gitignored, copied from briefbot_config.py.example) exists AND
-# briefbot_audio.py was pushed alongside this app. Either missing
-# import disables the voice path; the picker still works offline.
-try:
-    import briefbot_config as _cfg
-    _LAPTOP_IP = getattr(_cfg, "LAPTOP_IP", None)
-    _LAPTOP_PORT = getattr(_cfg, "LAPTOP_PORT", 5005)
-except ImportError:
-    _LAPTOP_IP = None
-    _LAPTOP_PORT = 5005
-
-try:
-    import briefbot_audio
-except ImportError as e:
-    print("briefbot: voice module unavailable:", e)
-    briefbot_audio = None
-
-VOICE_ENABLED = bool(_LAPTOP_IP) and briefbot_audio is not None
 
 
 _BLACK = 0x000000
@@ -72,69 +49,73 @@ _LCD = M5.Lcd
 _W = 240
 _H = 135
 
-_MENU_X = 10
-_MENU_RIGHT = _W - 10
+# Picker layout: header / filter row / list / hint
+_FILTER_Y = 24
+_FILTER_H = 14
+_FIRST_ROW_Y = 42
 _ROW_H = 16
-_FIRST_ROW_Y = 28
 _MAX_VISIBLE = 5
 
 _S_PICKER = 0
 _S_BRIEF = 1
-
-_PICKER_HINT = ("; .  Enter  SPACE talk  Q quit"
-                if VOICE_ENABLED else
-                "; .  Enter pick  Q quit")
 
 
 def _set_font():
     try:
         _LCD.setFont(_LCD.FONTS.DejaVu9)
     except Exception as e:
-        # Build without FONTS; fall back to default. Not fatal.
         print("briefbot: setFont fallback:", e)
 
 
-def _intent(k):
-    """Normalize a MatrixKeyboard return to up/down/select/back/None.
+# ---------- key intent ----------
 
-    Cardputer-Adv arrow keys report as `;` `,` `.` `/` (the labels are
-    silk-screened arrows but the unshifted ASCII is what comes back).
-    Enter reports as 0x0A on this firmware build, not 0x0D — accept
-    both. ESC is 0x1B. Same approach as the launcher in main.py.
+def _intent(k):
+    """Map a MatrixKeyboard return to one of:
+      ('select', None) | ('back', None) | ('backspace', None)
+      ('up', None)     | ('down', None)
+      ('type', char)   | (None, None)
+
+    Cardputer-Adv arrow keys silk-screen as ; , . / so those four are
+    treated as scroll, NOT typed. Everything else printable
+    (letters/digits/space/hyphen) becomes filter input. Enter is 0x0A
+    on this firmware — accept 0x0D too for forward-compat. Backspace
+    can report as 0x08 (BS) or 0x7F (DEL); accept both.
     """
     if k is None:
-        return None
+        return (None, None)
     if isinstance(k, int):
-        if k in (0x0A, 0x0D):
-            return "select"
-        if k == 0x1B:
-            return "back"
+        if k in (0x0A, 0x0D): return ("select", None)
+        if k == 0x1B:         return ("back", None)
+        if k in (0x08, 0x7F): return ("backspace", None)
         if 0x20 <= k <= 0x7E:
             k = chr(k)
         else:
-            return None
+            return (None, None)
     if not isinstance(k, str) or not k:
-        return None
-    ch = k.lower()
-    if ch in (";", ",", "w"):
-        return "up"
-    if ch in (".", "/", "s"):
-        return "down"
-    if ch in ("\r", "\n"):
-        return "select"
-    if ch in ("q", "\x1b"):
-        return "back"
-    if ch == " ":
-        return "voice"
-    return None
+        return (None, None)
+    if k in ("\r", "\n"):     return ("select", None)
+    if k == "\x1b":           return ("back", None)
+    if k in ("\b", "\x7f"):   return ("backspace", None)
+    if k in (";", ","):       return ("up", None)
+    if k in (".", "/"):       return ("down", None)
+    c = k[0]
+    if 0x20 <= ord(c) <= 0x7E:
+        return ("type", c)
+    return (None, None)
 
 
-def _draw_header(title):
+# ---------- chrome ----------
+
+def _draw_header(title, count_text=None):
     _LCD.fillRect(0, 0, _W, 20, _DARK)
     _LCD.fillRect(0, 20, _W, 1, _ORANGE)
     _LCD.setTextSize(1)
     _LCD.setTextColor(_ORANGE, _DARK)
     _LCD.drawString(title, 6, 5)
+    if count_text:
+        _LCD.setTextColor(_GRAY_MID, _DARK)
+        _LCD.drawString(count_text,
+                        _W - _LCD.textWidth(count_text) - 6, 5)
 
 
 def _draw_hint(text):
@@ -144,68 +125,99 @@ def _draw_hint(text):
     _LCD.drawString(text, (_W - _LCD.textWidth(text)) // 2, _H - 14)
 
 
-def _draw_picker(prospects, cursor, scroll_top):
-    _LCD.fillScreen(_BLACK)
-    _draw_header("Briefbot")
-    _LCD.setTextSize(1)
+# ---------- picker ----------
 
-    visible = prospects[scroll_top:scroll_top + _MAX_VISIBLE]
+def _draw_filter_row(filter_text):
+    _LCD.fillRect(0, _FILTER_Y, _W, _FILTER_H, _BLACK)
+    _LCD.setTextSize(1)
+    if filter_text:
+        _LCD.setTextColor(_GRAY_MID, _BLACK)
+        _LCD.drawString(">", 6, _FILTER_Y + 2)
+        _LCD.setTextColor(_ORANGE, _BLACK)
+        _LCD.drawString(filter_text + "_", 16, _FILTER_Y + 2)
+    else:
+        _LCD.setTextColor(_GRAY_MID, _BLACK)
+        _LCD.drawString("type to filter", 6, _FILTER_Y + 2)
+
+
+def _truncate_to_width(text, max_w):
+    if _LCD.textWidth(text) <= max_w:
+        return text
+    while len(text) > 4 and _LCD.textWidth(text + "...") > max_w:
+        text = text[:-1]
+    return text + "..."
+
+
+def _draw_picker(filtered, cursor, scroll_top, total, filter_text):
+    _LCD.fillScreen(_BLACK)
+    _draw_header("Briefbot", "{}/{}".format(len(filtered), total))
+    _draw_filter_row(filter_text)
+
+    if not filtered:
+        _LCD.setTextSize(1)
+        _LCD.setTextColor(_GRAY_MID, _BLACK)
+        msg = "no matches"
+        _LCD.drawString(msg, (_W - _LCD.textWidth(msg)) // 2,
+                        _FIRST_ROW_Y + 12)
+        _draw_hint("backspace to edit  Q quit")
+        return
+
+    visible = filtered[scroll_top:scroll_top + _MAX_VISIBLE]
     y = _FIRST_ROW_Y
-    for i, (display, _key) in enumerate(visible):
+    _LCD.setTextSize(1)
+    for i, (display, _idx) in enumerate(visible):
         abs_i = scroll_top + i
         if abs_i == cursor:
-            _LCD.fillRect(4, y - 2, _MENU_RIGHT - 4, _ROW_H - 2, _ORANGE)
+            _LCD.fillRect(4, y - 2, _W - 8, _ROW_H - 2, _ORANGE)
             _LCD.setTextColor(_BLACK, _ORANGE)
         else:
             _LCD.setTextColor(_CREAM, _BLACK)
-        _LCD.drawString(display, _MENU_X, y)
+        _LCD.drawString(_truncate_to_width(display, _W - 18), 10, y)
         y += _ROW_H
 
     if scroll_top > 0:
         _LCD.setTextColor(_ORANGE, _BLACK)
-        _LCD.drawString("^", _MENU_RIGHT - 8, _FIRST_ROW_Y)
-    if scroll_top + _MAX_VISIBLE < len(prospects):
+        _LCD.drawString("^", _W - 10, _FIRST_ROW_Y - 2)
+    if scroll_top + _MAX_VISIBLE < len(filtered):
         _LCD.setTextColor(_ORANGE, _BLACK)
-        _LCD.drawString("v", _MENU_RIGHT - 8,
-                        _FIRST_ROW_Y + (len(visible) - 1) * _ROW_H)
+        _LCD.drawString("v", _W - 10, y - _ROW_H + 6)
 
-    _draw_hint(_PICKER_HINT)
+    _draw_hint("; .  Enter pick  Q back")
 
+
+def _filter(all_names, q):
+    """Return list of (display_name, original_index) matching `q`.
+    Empty q returns everything; non-empty does substring (case-insensitive).
+    """
+    if not q:
+        return [(n, i) for i, n in enumerate(all_names)]
+    ql = q.lower()
+    return [(n, i) for i, n in enumerate(all_names) if ql in n.lower()]
+
+
+# ---------- brief ----------
 
 def _wrap(text, max_chars):
-    """Naive word-wrap. Returns lines each <= max_chars long.
-
-    DejaVu9 is proportional — the right way is `_LCD.textWidth()` per
-    line — but at 240 px content width, a 35-char cap at size 1 is a
-    safe under-estimate for any reasonable mix of glyphs. If a brief
-    has wide-glyph-heavy text and clips, drop max_chars to 32.
-    """
     if not text:
         return []
     words = text.split()
-    lines = []
+    out = []
     cur = ""
     for w in words:
         if not cur:
             cur = w
         elif len(cur) + 1 + len(w) <= max_chars:
-            cur = cur + " " + w
+            cur += " " + w
         else:
-            lines.append(cur)
+            out.append(cur)
             cur = w
     if cur:
-        lines.append(cur)
-    return lines
+        out.append(cur)
+    return out
 
 
 def _render_brief_lines(brief):
-    """Flatten a brief dict into [(color, size, text)] for paged scroll.
-
-    The caller (`_draw_brief`) walks this list and stops when it runs
-    out of vertical room, painting an arrow indicator if there's more
-    below. Mixed sizes (2 for the company name, 1 for everything else)
-    use different y-advances — see `_draw_brief`.
-    """
+    """Flatten brief dict -> [(color, size, text)] for paged scroll."""
     lines = []
     lines.append((_ORANGE, 2, brief.get("name", "(no name)")))
 
@@ -231,23 +243,22 @@ def _render_brief_lines(brief):
     pts = brief.get("talking_points") or []
     if pts:
         lines.append((_CREAM, 1, ""))
-        lines.append((_ORANGE, 1, "Talking points:"))
+        lines.append((_ORANGE, 1, "Notes:"))
         for p in pts:
-            wrapped = _wrap("- " + p, 35)
-            for j, ln in enumerate(wrapped):
+            for j, ln in enumerate(_wrap("- " + p, 35)):
                 lines.append((_CREAM, 1, ln if j == 0 else "  " + ln))
 
     contacts = brief.get("contacts") or []
     if contacts:
         lines.append((_CREAM, 1, ""))
-        lines.append((_ORANGE, 1, "Contacts:"))
+        lines.append((_ORANGE, 1, "Owner:"))
         for c in contacts:
-            head = (c.get("name", "?") or "?") + " - " + (c.get("title", "?") or "?")
+            head = (c.get("name", "?") or "?")
+            t = (c.get("title", "") or "").strip()
+            if t:
+                head = head + " - " + t
             for line in _wrap(head, 35):
                 lines.append((_CREAM, 1, line))
-            email = c.get("email")
-            if email:
-                lines.append((_GRAY_MID, 1, "  " + email))
 
     return lines
 
@@ -255,7 +266,6 @@ def _render_brief_lines(brief):
 def _draw_brief(lines, scroll):
     _LCD.fillScreen(_BLACK)
     _draw_header("Brief")
-
     y = 26
     bottom = _H - 22
     drawn = 0
@@ -268,7 +278,6 @@ def _draw_brief(lines, scroll):
         _LCD.drawString(text, 6, y)
         y += adv
         drawn += 1
-
     has_more = (scroll + drawn) < len(lines)
 
     _LCD.setTextSize(1)
@@ -282,155 +291,35 @@ def _draw_brief(lines, scroll):
     _draw_hint("; . scroll  Q back")
 
 
-def _draw_no_match(label):
-    _LCD.fillScreen(_BLACK)
-    _draw_header("Briefbot")
-    _LCD.setTextSize(1)
-    _LCD.setTextColor(_GRAY_MID, _BLACK)
-    msg = "No prospect matched"
-    _LCD.drawString(msg, (_W - _LCD.textWidth(msg)) // 2, 50)
-    if label:
-        _LCD.setTextColor(_CREAM, _BLACK)
-        s = label[:32]
-        _LCD.drawString(s, (_W - _LCD.textWidth(s)) // 2, 70)
-    _draw_hint("Q back")
-
-
-def _draw_status(text, color=_ORANGE, sub=None):
-    """Center-of-screen status overlay used during voice cycles."""
-    _LCD.fillScreen(_BLACK)
-    _draw_header("Briefbot")
-    _LCD.setTextSize(2)
-    _LCD.setTextColor(color, _BLACK)
-    _LCD.drawString(text, (_W - _LCD.textWidth(text)) // 2, 46)
-    if sub:
-        _LCD.setTextSize(1)
-        _LCD.setTextColor(_GRAY_MID, _BLACK)
-        _LCD.drawString(sub, (_W - _LCD.textWidth(sub)) // 2, 78)
-    _draw_hint("SPACE stop  (5s max)")
-
-
-def _flash_error(text):
-    """Brief red toast on the hint strip. Caller restores hint after."""
-    _LCD.fillRect(0, _H - 18, _W, 18, _DARK)
-    _LCD.setTextSize(1)
-    _LCD.setTextColor(_RED, _DARK)
-    _LCD.drawString(text, (_W - _LCD.textWidth(text)) // 2, _H - 14)
-    time.sleep_ms(1200)
-
-
-def _do_voice_cycle(kb):
-    """Run a voice query end-to-end.
-
-    Returns (brief, err). On success brief is a dict and err is None;
-    on failure brief is None and err is a short toast string. The
-    caller repaints the picker; this function leaves the screen on
-    the last status overlay so a quick toast can land on top.
-    """
-    if not VOICE_ENABLED:
-        return None, "voice off"
-
-    _draw_status("Listening", _ORANGE, "speak now")
-
-    try:
-        sock, buf = briefbot_audio.open_stream(_LAPTOP_IP, _LAPTOP_PORT)
-    except Exception as e:
-        print("briefbot: connect:", e)
-        return None, "connect failed"
-
-    start = time.ticks_ms()
-    try:
-        while True:
-            briefbot_audio.stream_chunk(sock, buf)
-            kb.tick()
-            stop = _intent(kb.get_key()) == "voice"
-            timed_out = time.ticks_diff(time.ticks_ms(), start) > 5000
-            if stop or timed_out:
-                break
-    except Exception as e:
-        print("briefbot: stream:", e)
-        try:
-            sock.close()
-        except Exception:
-            pass
-        return None, "stream error"
-
-    _draw_status("Transcribing", _GRAY_MID, "(~2s)")
-
-    try:
-        line = briefbot_audio.end_stream(sock)
-    except Exception as e:
-        print("briefbot: end_stream:", e)
-        return None, "no response"
-
-    if not line:
-        return None, "empty response"
-
-    try:
-        import json
-        resp = json.loads(line)
-    except Exception as e:
-        print("briefbot: json:", e, "line=", line[:80])
-        return None, "bad response"
-
-    if not resp.get("ok"):
-        return None, (resp.get("err") or "no match")[:24]
-
-    brief = resp.get("brief")
-    if not brief:
-        return None, "empty brief"
-
-    return brief, None
-
-
-def _list_prospects():
-    """Return [(display_name, key)] pairs from the local fixture.
-
-    The API module exposes `lookup()` but not a full enumeration —
-    deliberately, so the device-side picker doesn't pretend to be the
-    canonical "today's meetings" list once Phase 3 lands. For V1 we
-    reach into the fixture module here; in Phase 3 the laptop pushes
-    the real list and this function reads from a cache instead.
-    """
-    try:
-        import briefbot_fixtures
-        items = []
-        for key, brief in briefbot_fixtures.PROSPECTS.items():
-            items.append((brief.get("name", key), key))
-        items.sort()
-        return items
-    except Exception as e:
-        print("briefbot: list error:", e)
-        return []
-
+# ---------- main loop ----------
 
 def run():
-    print("briefbot: run() start, voice=",
-          "ON" if VOICE_ENABLED else "off",
-          "ip=", _LAPTOP_IP)
+    print("briefbot: run() start")
     _set_font()
 
-    prospects = _list_prospects()
+    all_names = briefbot_api.list_names()
+    print("briefbot: loaded", len(all_names), "names")
 
     state = _S_PICKER
+    filter_text = ""
+    filtered = _filter(all_names, filter_text)
     cursor = 0
     scroll_top = 0
     brief_lines = []
     brief_scroll = 0
 
-    if prospects:
-        _draw_picker(prospects, cursor, scroll_top)
-    else:
+    if not all_names:
         _LCD.fillScreen(_BLACK)
         _draw_header("Briefbot")
-        _LCD.setTextSize(1)
+        _LCD.setTextColor(_RED, _BLACK)
+        _LCD.drawString("data file missing", 6, 50)
         _LCD.setTextColor(_GRAY_MID, _BLACK)
-        _LCD.drawString("No fixtures loaded", 6, 50)
+        _LCD.drawString("push briefbot_index.txt", 6, 70)
+        _LCD.drawString("and briefbot_data.jsonl", 6, 84)
         _draw_hint("Q quit")
+    else:
+        _draw_picker(filtered, cursor, scroll_top, len(all_names), filter_text)
 
-    # MatrixKeyboard timing matches the rest of the bundle:
-    # 800 ms cold-boot pre-init (matrix IC settle), then 400 ms post-
-    # init debounce so the launch keypress doesn't double as a select.
     time.sleep_ms(800)
     kb = MatrixKeyboard()
     time.sleep_ms(400)
@@ -438,64 +327,90 @@ def run():
     try:
         while True:
             kb.tick()
-            intent = _intent(kb.get_key())
+            intent, ch = _intent(kb.get_key())
 
             if state == _S_PICKER:
-                if not prospects:
-                    if intent == "back":
-                        return
-                elif intent == "up":
-                    cursor = (cursor - 1) % len(prospects)
-                    if cursor < scroll_top:
-                        scroll_top = cursor
-                    elif cursor >= scroll_top + _MAX_VISIBLE:
-                        scroll_top = max(0, len(prospects) - _MAX_VISIBLE)
-                    _draw_picker(prospects, cursor, scroll_top)
-                elif intent == "down":
-                    cursor = (cursor + 1) % len(prospects)
-                    if cursor >= scroll_top + _MAX_VISIBLE:
-                        scroll_top = cursor - _MAX_VISIBLE + 1
-                    elif cursor < scroll_top:
+                if not filtered and intent != "back" and intent != "backspace" and intent != "type":
+                    if intent is None:
+                        time.sleep_ms(40)
+                        continue
+                    # Allow only edit/back when no matches
+                    pass
+
+                if intent == "type" and ch is not None:
+                    filter_text += ch
+                    filtered = _filter(all_names, filter_text)
+                    cursor = 0
+                    scroll_top = 0
+                    _draw_picker(filtered, cursor, scroll_top,
+                                 len(all_names), filter_text)
+                elif intent == "backspace":
+                    if filter_text:
+                        filter_text = filter_text[:-1]
+                        filtered = _filter(all_names, filter_text)
+                        cursor = 0
                         scroll_top = 0
-                    _draw_picker(prospects, cursor, scroll_top)
+                        _draw_picker(filtered, cursor, scroll_top,
+                                     len(all_names), filter_text)
+                elif intent == "up":
+                    if filtered:
+                        cursor = (cursor - 1) % len(filtered)
+                        if cursor < scroll_top:
+                            scroll_top = cursor
+                        elif cursor >= scroll_top + _MAX_VISIBLE:
+                            scroll_top = max(0, len(filtered) - _MAX_VISIBLE)
+                        _draw_picker(filtered, cursor, scroll_top,
+                                     len(all_names), filter_text)
+                elif intent == "down":
+                    if filtered:
+                        cursor = (cursor + 1) % len(filtered)
+                        if cursor >= scroll_top + _MAX_VISIBLE:
+                            scroll_top = cursor - _MAX_VISIBLE + 1
+                        elif cursor < scroll_top:
+                            scroll_top = 0
+                        _draw_picker(filtered, cursor, scroll_top,
+                                     len(all_names), filter_text)
                 elif intent == "select":
-                    _, key = prospects[cursor]
-                    brief = briefbot_api.lookup(key)
-                    state = _S_BRIEF
-                    brief_scroll = 0
-                    if brief is None:
-                        brief_lines = []
-                        _draw_no_match(key)
-                    else:
-                        brief_lines = _render_brief_lines(brief)
-                        _draw_brief(brief_lines, brief_scroll)
-                elif intent == "voice" and VOICE_ENABLED:
-                    brief, err = _do_voice_cycle(kb)
-                    if brief:
-                        brief_lines = _render_brief_lines(brief)
-                        brief_scroll = 0
-                        state = _S_BRIEF
-                        _draw_brief(brief_lines, brief_scroll)
-                    else:
-                        _draw_picker(prospects, cursor, scroll_top)
-                        if err:
-                            _flash_error(err)
-                            _draw_hint(_PICKER_HINT)
+                    if filtered:
+                        _, src_idx = filtered[cursor]
+                        # Loading hint while we read the (lazy) brief
+                        _draw_hint("loading...")
+                        brief = briefbot_api.get(src_idx)
+                        if brief is None:
+                            _draw_hint("load failed")
+                            time.sleep_ms(900)
+                            _draw_picker(filtered, cursor, scroll_top,
+                                         len(all_names), filter_text)
+                        else:
+                            brief_lines = _render_brief_lines(brief)
+                            brief_scroll = 0
+                            state = _S_BRIEF
+                            _draw_brief(brief_lines, brief_scroll)
                 elif intent == "back":
-                    return
+                    if filter_text:
+                        # First press clears filter
+                        filter_text = ""
+                        filtered = _filter(all_names, filter_text)
+                        cursor = 0
+                        scroll_top = 0
+                        _draw_picker(filtered, cursor, scroll_top,
+                                     len(all_names), filter_text)
+                    else:
+                        return
 
             elif state == _S_BRIEF:
                 if intent == "up":
-                    if brief_lines and brief_scroll > 0:
+                    if brief_scroll > 0:
                         brief_scroll -= 1
                         _draw_brief(brief_lines, brief_scroll)
                 elif intent == "down":
-                    if brief_lines and brief_scroll < len(brief_lines) - 1:
+                    if brief_scroll < len(brief_lines) - 1:
                         brief_scroll += 1
                         _draw_brief(brief_lines, brief_scroll)
                 elif intent == "back":
                     state = _S_PICKER
-                    _draw_picker(prospects, cursor, scroll_top)
+                    _draw_picker(filtered, cursor, scroll_top,
+                                 len(all_names), filter_text)
 
             time.sleep_ms(40)
     finally:
