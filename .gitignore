@@ -1,0 +1,15 @@
+# Per-host config — laptop IP, ports, etc. Sample at briefbot_config.py.example
+buddy/device/briefbot_config.py
+
+# Phase 3 secrets on the laptop side
+host/.env
+host/audio_dump/
+host/*.wav
+host/__pycache__/
+
+# Python bytecode anywhere
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

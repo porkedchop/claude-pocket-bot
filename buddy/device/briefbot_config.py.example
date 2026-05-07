@@ -1,0 +1,21 @@
+# Briefbot per-device config.
+#
+# Copy this file to `briefbot_config.py` (no .example suffix) and fill
+# in your laptop's IP on the event WiFi. The real file is gitignored;
+# this template is committed.
+#
+#   cp briefbot_config.py.example briefbot_config.py
+#   # then edit briefbot_config.py
+#
+# Find your laptop's IP on macOS:
+#
+#   ipconfig getifaddr en0
+#
+# (Use en1 if you're on a USB-C Ethernet adapter.) Both the Cardputer
+# and the laptop need to be on the same WiFi (`cardputer` / `cardconnect`
+# at the event venue) AND the venue must NOT have client isolation
+# enabled. If isolation is on, run a personal hotspot off your laptop
+# and connect the Cardputer to that instead — same config, different IP.
+
+LAPTOP_IP = "192.168.1.100"
+LAPTOP_PORT = 5005
